@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd 
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd 
+          http://www.mulesoft.org/schema/mule/core
+          http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+          http://www.mulesoft.org/schema/mule/salesforce
+          http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd
+          http://www.mulesoft.org/schema/mule/http
+          http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+          http://www.mulesoft.org/schema/mule/ee/core
+          http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <configuration-properties file="config.yaml" doc:name="Config Properties"/>
+
+    <salesforce:sfdc-config name="Salesforce_Config" doc:name="Salesforce Config">
+        <salesforce:basic-connection
+            username="${salesforce.username}"
+            password="${salesforce.password}"
+            securityToken="${salesforce.token}"
+            url="https://test.salesforce.com/services/Soap/u/56.0"/>
+    </salesforce:sfdc-config>
+    
+    <http:request-config name="SAP_Simulator_Request_Config" doc:name="SAP Simulator Request Config">
+    <http:request-connection host="localhost" port="8084"/>
+	</http:request-config>
+
+    <http:listener-config name="HTTP_Listener_Config" doc:name="HTTP Listener Config">
+        <http:listener-connection host="0.0.0.0" port="8083"/>
+    </http:listener-config>
+
+    <flow name="sap-to-salesforce-flow">
+
+        <http:listener config-ref="HTTP_Listener_Config" path="/sap/orders" allowedMethods="POST" doc:name="Receive SAP Orders"/>
+
+        <logger level="INFO" message="#['SAP Orders received']" doc:name="Log Received"/>
+
+        <ee:transform doc:name="Map SAP to Salesforce">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var orders = payload.d.results
+---
+orders map (order) -> {
+    SAP_Order_Number__c: order.SalesOrder,
+    SAP_Customer_ID__c: order.SoldToParty,
+    SAP_Order_Type__c: order.SalesOrderType,
+    SAP_Total_Amount__c: order.TotalNetAmount as Number default 0,
+    SAP_Currency__c: order.TransactionCurrency,
+    SAP_Delivery_Status__c: order.OverallDeliveryStatus,
+    Name: "SAP-" ++ order.SalesOrder
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <salesforce:create
+            config-ref="Salesforce_Config"
+            type="SAP_Order__c"
+            doc:name="Create SAP Orders in Salesforce">
+            <salesforce:records>#[payload]</salesforce:records>
+        </salesforce:create>
+<logger level="INFO" message="#[output application/json --- payload]" doc:name="Log Create Result"/>
+        <ee:transform doc:name="Return Response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ status: "success", message: "SAP Orders synced to Salesforce" }]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <logger level="INFO" message="#['SAP Orders synced successfully']" doc:name="Success Logger"/>
+
+        <error-handler>
+            <on-error-continue type="ANY" doc:name="Generic Error">
+                <logger level="ERROR" message="#['SAP Sync Error: ' ++ error.description]" doc:name="Error Logger"/>
+            </on-error-continue>
+        </error-handler>
+
+    </flow>
+		<!-- SAP Simulator : reçoit le Sales Order et retourne un numéro SAP -->
+<http:listener-config name="SAP_Simulator_Config" doc:name="SAP Simulator Config">
+    <http:listener-connection host="0.0.0.0" port="8084"/>
+</http:listener-config>
+
+<flow name="sap-simulator-flow">
+    <http:listener config-ref="SAP_Simulator_Config" path="/sap/create" allowedMethods="POST" doc:name="SAP Simulator Listener"/>
+    
+    <logger level="INFO" message="#['SAP Simulator received order']" doc:name="Log Received"/>
+    
+    <ee:transform doc:name="Return SAP Order Number">
+        <ee:message>
+            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    SalesOrder: "SAP-" ++ (now() as Number as String),
+    Status: "Created",
+    Message: "Sales Order created successfully in SAP"
+}]]></ee:set-payload>
+        </ee:message>
+    </ee:transform>
+    
+    <logger level="INFO" message="#['SAP Simulator response sent']" doc:name="Log Response"/>
+</flow>
+<!-- Salesforce → SAP : écoute Platform Event et crée Sales Order dans SAP -->
+<flow name="sf-to-sap-flow">
+    <salesforce:subscribe-channel-listener
+        config-ref="Salesforce_Config"
+        streamingChannel="/event/OpportunityClosedWon__e"
+        doc:name="Listen OpportunityClosedWon Event"/>
+
+    <logger level="INFO" message="#['Opportunity Closed Won event received']" doc:name="Log Event"/>
+
+    <ee:transform doc:name="Map Opportunity to SAP Order">
+        <ee:message>
+            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    SalesOrderType: "OR",
+    SalesOrganization: "1710",
+    DistributionChannel: "10",
+    OrganizationDivision: "00",
+    SoldToParty: payload.payload.AccountName__c default "UNKNOWN",
+    PurchaseOrderByCustomer: payload.payload.OpportunityId__c default "",
+    RequestedDeliveryDate: now() as String {format: "yyyy-MM-dd"},
+    TotalNetAmount: payload.payload.Amount__c default 0,
+    TransactionCurrency: "EUR"
+}]]></ee:set-payload>
+        </ee:message>
+    </ee:transform>
+
+    <http:request
+        config-ref="SAP_Simulator_Request_Config"
+        method="POST"
+        path="/sap/create"
+        doc:name="POST to SAP Simulator">
+        <http:headers>#[{"Content-Type": "application/json"}]</http:headers>
+    </http:request>
+
+    <logger level="INFO" message="#['SAP response received']" doc:name="Log SAP Response"/>
+
+    <ee:transform doc:name="Extract SAP Order Number">
+        <ee:message>
+            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+        </ee:message>
+    </ee:transform>
+
+    <error-handler>
+        <on-error-continue type="ANY" doc:name="Generic Error">
+            <logger level="ERROR" message="#['SF to SAP Error: ' ++ error.description]" doc:name="Error Logger"/>
+        </on-error-continue>
+    </error-handler>
+
+</flow>
+</mule>
