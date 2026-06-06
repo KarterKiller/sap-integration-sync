@@ -1,37 +1,41 @@
-# sap-salesforce-sync
+# sap-integration-sync
 
 Bidirectional SAP S/4HANA ↔ Salesforce integration via MuleSoft Anypoint Studio.
 
 ## Overview
 
-This project implements a full bidirectional integration between SAP S/4HANA and Salesforce using MuleSoft as the middleware layer. It covers two integration flows:
+This project implements a full bidirectional integration between SAP S/4HANA and Salesforce using MuleSoft as the middleware layer. It covers two integration flows, with a closed feedback loop on the outbound side:
 
-- **SAP → Salesforce**: Fetches Sales Orders from SAP S/4HANA OData V2 API and creates custom `SAP_Order__c` records in Salesforce
-- **Salesforce → SAP**: Listens to Salesforce Platform Events (`OpportunityClosedWon__e`) and creates a Sales Order in SAP when an Opportunity is closed
+- **SAP → Salesforce**: Fetches Sales Orders from the SAP S/4HANA OData V2 API and creates custom `SAP_Order__c` records in Salesforce
+- **Salesforce → SAP**: Listens to Salesforce Platform Events (`OpportunityClosedWon__e`), creates a Sales Order in SAP when an Opportunity is closed, then writes the returned SAP order number back onto the Opportunity
 
 ## Architecture
 
 ```
 SAP S/4HANA (OData V2)
-        │
-        │  curl --compressed (gzip handling)
-        ▼
+        |
+        |  curl --compressed (gzip handling)
+        v
 MuleSoft HTTP Listener (port 8083)
-        │
-        │  DataWeave 2.0 transformation
-        ▼
+        |
+        |  DataWeave 2.0 transformation
+        v
 Salesforce SAP_Order__c (custom object)
 
 
 Salesforce Opportunity (Closed Won)
-        │
-        │  Platform Event: OpportunityClosedWon__e
-        ▼
+        |
+        |  Platform Event: OpportunityClosedWon__e
+        v
 MuleSoft Salesforce Connector (subscribe-channel-listener)
-        │
-        │  DataWeave 2.0 transformation
-        ▼
+        |
+        |  DataWeave 2.0 transformation
+        v
 SAP Sales Order creation (simulated endpoint port 8084)
+        |
+        |  returned SAP order number
+        v
+MuleSoft updates Opportunity.SAP_Order_Number__c
 ```
 
 ## Tech Stack
@@ -45,7 +49,7 @@ SAP Sales Order creation (simulated endpoint port 8084)
 ## Project Structure
 
 ```
-sap-salesforce-sync/
+sap-integration-sync/
 ├── src/
 │   └── main/
 │       ├── mule/
@@ -77,12 +81,17 @@ sap-salesforce-sync/
 
 ### 2. `sf-to-sap-flow`
 - **Trigger**: Salesforce Platform Event `OpportunityClosedWon__e`
-- **Processing**: DataWeave maps Opportunity data to SAP Sales Order format
-- **Output**: POST to SAP endpoint with Sales Order payload
+- **Processing**:
+  1. Stores the Opportunity Id in a variable (`data.payload.OpportunityId__c`)
+  2. DataWeave maps Opportunity data to SAP Sales Order format
+  3. POSTs the payload to the SAP simulator endpoint
+  4. Captures the SAP order number from the response
+  5. Updates the originating Opportunity with `SAP_Order_Number__c`
+- **Output**: SAP Sales Order created + Opportunity enriched with its SAP reference
 
 ### 3. `sap-simulator-flow`
 - **Trigger**: HTTP POST on `localhost:8084/sap/create`
-- **Purpose**: Simulates SAP S/4HANA write endpoint (sandbox is read-only)
+- **Purpose**: Simulates the SAP S/4HANA write endpoint (the public sandbox is read-only)
 - **Output**: Returns a generated SAP Sales Order number
 
 ## Setup
@@ -109,7 +118,7 @@ sap:
 
 ### Salesforce Setup
 
-Create the following custom object in Salesforce:
+Create the following custom object:
 
 **Object**: `SAP_Order__c`
 
@@ -122,10 +131,21 @@ Create the following custom object in Salesforce:
 | SAP Currency | `SAP_Currency__c` | Text (10) |
 | SAP Delivery Status | `SAP_Delivery_Status__c` | Text (10) |
 
+Add a custom field on the **Opportunity** object to store the SAP reference returned by the outbound flow:
+
+| Field Label | API Name | Type |
+|---|---|---|
+| SAP Order Number | `SAP_Order_Number__c` | Text (50) |
+
 Create the Platform Event `OpportunityClosedWon__e` with fields:
 - `OpportunityId__c` (Text 255)
 - `AccountName__c` (Text 255)
 - `Amount__c` (Number)
+
+A record-triggered Flow on Opportunity publishes this event when `StageName = Closed Won`, mapping `OpportunityId__c` to the Opportunity record Id.
+
+
+![MuleSoft application deployed](screenshots/screenshot01-deployed.png)
 
 ### Running the Integration
 
@@ -141,19 +161,25 @@ curl --compressed "https://sandbox.api.sap.com/s4hanacloud/sap/opu/odata/sap/API
 
 **Salesforce → SAP:**
 
-Pass an Opportunity to **Closed Won** in Salesforce — the Platform Event fires automatically and MuleSoft handles the rest.
+Move an Opportunity to **Closed Won** in Salesforce. The Platform Event fires automatically, MuleSoft creates the SAP order, and the returned SAP number is written back onto the Opportunity.
 
 ## Key Technical Challenge: SAP Sandbox Gzip Compression
 
-The SAP sandbox compresses all responses with gzip regardless of the `Accept-Encoding: identity` header. MuleSoft modules (Scripting, Compression) don't support Java 17, making in-flow decompression impossible.
+The SAP sandbox compresses all responses with gzip regardless of the `Accept-Encoding: identity` header. The MuleSoft modules that could decompress in-flow (Scripting, Compression) do not support Java 17, which the 4.11 runtime requires — and downgrading the runtime to Java 11 broke startup. This created a circular dependency with no in-flow fix on this runtime.
 
-**Solution**: Pipe curl (which natively decompresses gzip with `--compressed`) into a second curl POST to the MuleSoft HTTP Listener. MuleSoft receives clean JSON and processes it normally.
+**Solution**: `curl` natively decompresses gzip with the `--compressed` flag. Piping the SAP response through curl into a second POST to the MuleSoft HTTP Listener delivers clean JSON to the flow.
 
 ```bash
 curl --compressed [SAP endpoint] | curl -X POST [MuleSoft listener] -d @-
 ```
 
+**Production note**: this is a POC-stage workaround. A production version would resolve decompression natively inside MuleSoft (compatible runtime/Java/module combination) and replace the manual curl step with a scheduler plus OData pagination (`$top` / `$skip`) for full automated sync.
+
+## Companion Project
+
+The Salesforce-side dashboard (LWC + Apex) that visualizes both integration directions lives in a separate repository: **sap-integration-dashboard**.
+
 ## Author
 
-**Karim Tayassi** — Salesforce Developer  
+**Karim Tayassi** — Salesforce Developer
 [LinkedIn](https://linkedin.com/in/karim-tayassi) · [GitHub](https://github.com/KarterKiller)

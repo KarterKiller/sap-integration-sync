@@ -117,6 +117,12 @@ output application/json
         doc:name="Listen OpportunityClosedWon Event"/>
 
     <logger level="INFO" message="#['Opportunity Closed Won event received']" doc:name="Log Event"/>
+	<logger level="INFO" message="#['RAW EVENT: ' ++ write(payload, 'application/json')]" doc:name="Log Raw Event"/>
+    <!-- Stocke l'Opportunity Id AVANT de transformer le payload -->
+    <set-variable
+        variableName="opportunityId"
+        value="#[payload.data.payload.OpportunityId__c]"
+        doc:name="Store Opportunity Id"/>
 
     <ee:transform doc:name="Map Opportunity to SAP Order">
         <ee:message>
@@ -128,7 +134,7 @@ output application/json
     SalesOrganization: "1710",
     DistributionChannel: "10",
     OrganizationDivision: "00",
-    SoldToParty: payload.payload.AccountName__c default "UNKNOWN",
+    SoldToParty: payload.data.payload.AccountName__c default "UNKNOWN",
     PurchaseOrderByCustomer: payload.payload.OpportunityId__c default "",
     RequestedDeliveryDate: now() as String {format: "yyyy-MM-dd"},
     TotalNetAmount: payload.payload.Amount__c default 0,
@@ -147,14 +153,35 @@ output application/json
 
     <logger level="INFO" message="#['SAP response received']" doc:name="Log SAP Response"/>
 
-    <ee:transform doc:name="Extract SAP Order Number">
+    <!-- Stocke le numéro SAP retourné -->
+    <set-variable
+        variableName="sapOrderNumber"
+        value="#[payload.SalesOrder]"
+        doc:name="Store SAP Order Number"/>
+
+    <!-- Met à jour l'Opportunity avec le numéro SAP -->
+    <ee:transform doc:name="Build Opportunity Update">
         <ee:message>
             <ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
-payload]]></ee:set-payload>
+[{
+    Id: vars.opportunityId,
+    SAP_Order_Number__c: vars.sapOrderNumber
+}]]]></ee:set-payload>
         </ee:message>
     </ee:transform>
+    
+<logger level="INFO" message="#['Payload to update: ' ++ write(payload, 'application/json')]" doc:name="Log Payload Before Update"/>
+
+    <salesforce:update
+        config-ref="Salesforce_Config"
+        type="Opportunity"
+        doc:name="Update Opportunity with SAP Number">
+        <salesforce:records>#[payload]</salesforce:records>
+    </salesforce:update>
+	<logger level="INFO" message="#[output application/json --- payload]" doc:name="Log Update Result"/>
+    <logger level="INFO" message="#['Opportunity updated with SAP Order Number']" doc:name="Log Update"/>
 
     <error-handler>
         <on-error-continue type="ANY" doc:name="Generic Error">
