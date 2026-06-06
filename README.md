@@ -146,6 +146,7 @@ A record-triggered Flow on Opportunity publishes this event when `StageName = Cl
 
 
 ![MuleSoft application deployed](screenshots/screenshot01-deployed.png)
+![LWC example](screenshots/screenshot02-LWC-example.png)
 
 ### Running the Integration
 
